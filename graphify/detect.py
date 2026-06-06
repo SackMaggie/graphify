@@ -405,6 +405,47 @@ def extract_pdf_text(path: Path) -> str:
         return ""
 
 
+_OPEN_Q  = "“"  # left double quotation mark used in AMEX spec for literal values
+_CLOSE_Q = "”"  # right double quotation mark
+
+# Pattern A: open-quote SPACE close-quote with value on a following line
+# {1,10} so single-char codes like "X", "Y", "N" are also captured.
+_PAIR_VALUE_AFTER_RE = re.compile(
+    _OPEN_Q + r"\s+" + _CLOSE_Q + r"((?:[^\n]*\n)+?)\s*([A-Z0-9]{1,10})\s*$",
+    re.MULTILINE,
+)
+# Pattern A2: value sandwiched mid-sentence across lines
+_PAIR_VALUE_MID_RE = re.compile(
+    _OPEN_Q + r"\s+" + _CLOSE_Q + r"\s*([^\n(]+)\n\s*([A-Z0-9]{1,10})\n\s*([^\n]+)",
+)
+# Pattern B: bullet (curly open-quote OR U+2022) followed by " - description \n VALUE"
+_BULLET_VALUE_RE = re.compile(
+    r"[" + _OPEN_Q + r"•](\s+-\s+[^\n]+)\n\s*([A-Z0-9]{1,10})\s*(?=\n|$)",
+    re.MULTILINE,
+)
+
+
+def _fix_cell(raw: str) -> str:
+    """Repair PDF typographic split-line quoted literals (AMEX spec pattern)."""
+    if raw is None:
+        return ""
+    s = raw.strip()
+
+    def _repl_mid(m: re.Match) -> str:
+        before, value, after = m.group(1).strip(), m.group(2), m.group(3).strip()
+        return f'"{value}" ({before} {after})'
+    s = _PAIR_VALUE_MID_RE.sub(_repl_mid, s)
+
+    def _repl_after(m: re.Match) -> str:
+        middle = m.group(1).replace("\n", " ").strip()
+        value = m.group(2)
+        return f'"{value}" {middle}' if middle else f'"{value}"'
+    s = _PAIR_VALUE_AFTER_RE.sub(_repl_after, s)
+
+    s = _BULLET_VALUE_RE.sub(lambda m: f'"{m.group(2)}"{m.group(1)}', s)
+    return s
+
+
 def _render_table(table: list) -> str:
     """Render a pdfplumber table list-of-rows into a pipe-delimited text block."""
     if not table:
@@ -416,7 +457,7 @@ def _render_table(table: list) -> str:
     for row in table:
         cells = []
         for col_idx, cell in enumerate(row):
-            val = str(cell or "").replace("\n", " ")
+            val = _fix_cell(str(cell or "")).replace("\n", " ")
             width = col_widths[col_idx] if col_idx < len(col_widths) else 10
             cells.append(val.ljust(width))
         lines.append(" | ".join(cells))
@@ -424,17 +465,43 @@ def _render_table(table: list) -> str:
 
 
 # Numbered section heading: "1.", "1.2", "1.2.3" followed by title words.
-# e.g. "1. Introduction", "2.3 Field Definitions"
+# Unicode-aware so Thai/CJK/Latin headings all match.
+# Starts with [1-9] to reject message/field codes like "0100", "001".
+# Requires at least one sub-level (N.M or N.M.K) to distinguish section headings
+# from numbered list items ("4. If a Cardholder..." matches N. but not N.M).
 _NUMBERED_HEADING_RE = re.compile(
-    r"^\d+(?:\.\d+)*\.?\s+[A-Za-z][A-Za-z0-9 /&:\-]{2,}$",
-    re.ASCII,
+    r"^[1-9]\d{0,2}(?:\.\d+)+\.?\s+\S[\S ]{2,}$",
 )
 
-# ALL-CAPS heading that starts with a letter (not a digit/code row).
-# Requires 2+ consecutive letters so hex strings are rejected.
+# ALL-CAPS heading: Latin uppercase only, letters+spaces, max 5 words.
+# Still ASCII-only — non-Latin scripts don't have "all caps" as a heading signal.
 _ALLCAPS_HEADING_RE = re.compile(
     r"^[A-Z][A-Z ]{2,}$",
     re.ASCII,
+)
+
+# Patterns that disqualify a line from being a heading even if it looks like one.
+# [.,;:]$ — sentence-ending punctuation catches list items and sentence fragments
+# ^\d+\s+[=(] — numeric code + label table rows ("83 (Fraud/Security", "107 = Please Call")
+# ^\d[\d.]+\s+-\s+ — DE subfield N.M - Description rows ("112.10 - Gift Card...")
+# ^• — bullet list items
+# ^\(continued\) — bare page-break continuation markers
+# \.{3,} — TOC dotted leader lines ("2.3 Overview.........12")
+# ^\d+(\s+[0-9A-F]{2}){2,} — hex/decimal dump sequences ("40 40 F8 F4...", "181 182 183")
+# ^Publication:|^Contact: — document metadata lines
+# Field-definition tokens catch table rows leaking from pdfplumber.
+_NOT_HEADING_RE = re.compile(
+    r"\d+\s*bytes|\d+\s*bits|\bN/A\b|\||\bNumeric\b|\bAlpha"
+    r"|[.,;:]$"
+    r"|^\d+\s+[=(]"
+    r"|^\d[\d.]+\s+-\s+"
+    r"|^•"
+    r"|^\(continued\)"
+    r"|\.{3,}"
+    r"|^\d+(\s+[0-9A-Fa-f]{2,3}){2,}"
+    r"|^Publication:|^Contact:"
+    r"|^[A-Z]{3,}[0-9]",
+    re.IGNORECASE,
 )
 
 
@@ -456,26 +523,32 @@ def extract_paper_no_llm(path: Path) -> dict:
 
     def _is_section_heading(line: str) -> bool:
         line = line.strip()
-        if not line:
+        if not line or _NOT_HEADING_RE.search(line):
             return False
         if _NUMBERED_HEADING_RE.match(line) and len(line) <= 100:
             return True
         if _ALLCAPS_HEADING_RE.match(line):
             words = line.split()
-            if 1 <= len(words) <= 5 and all(re.fullmatch(r"[A-Z]+", w) for w in words):
+            # Require ≥2 words each ≥2 chars, and at least one word ≥4 chars.
+            # Rejects single-word placeholders (YYMMDD, CCCCC), short-word abbreviations
+            # (V V PAY, JC JCB), while keeping real headings (AUTHORIZATION REQUEST,
+            # POINT OF SERVICE DATA CODE).
+            if (2 <= len(words) <= 5
+                    and all(len(w) >= 2 and re.fullmatch(r"[A-Z]+", w) for w in words)
+                    and max(len(w) for w in words) >= 4):
                 return True
         return False
 
     def _caption_from_lines(page_lines: list[str], table_data: list) -> str:
-        """Best-effort label for a table from preceding page text or its header row."""
+        """Best-effort label for a table from the nearest preceding text line."""
         for line in reversed(page_lines):
             line = line.strip()
-            if line and not line.startswith("---") and re.search(r"[A-Za-z]{3}", line):
+            if (line
+                    and not line.startswith("---")
+                    and "|" not in line
+                    and not _NOT_HEADING_RE.search(line)
+                    and re.search(r"[A-Za-z]{3}", line)):
                 return line[:100]
-        if table_data and table_data[0]:
-            header = " | ".join(str(c or "").strip() for c in table_data[0] if (c or "").strip())
-            if header:
-                return header[:100]
         return ""
 
     rel = path.name
@@ -500,12 +573,38 @@ def extract_paper_no_llm(path: Path) -> dict:
                 section_id: str | None = None
                 table_counter = 0
                 for page_num, page in enumerate(pdf.pages, start=1):
-                    page_text = page.extract_text(layout=False) or ""
-                    page_lines = page_text.splitlines()
+                    # Collect table bboxes first so we can mask them from body text.
+                    _tables = page.find_tables() or []
+                    _table_bboxes = [t.bbox for t in _tables]
+
+                    def _in_any_table(w) -> bool:
+                        wx0, wtop, wx1, wbot = w.get("x0", 0), w.get("top", 0), w.get("x1", 0), w.get("bottom", 0)
+                        for bx0, btop, bx1, bbot in _table_bboxes:
+                            if wx0 >= bx0 - 3 and wx1 <= bx1 + 3 and wtop >= btop - 3 and wbot <= bbot + 3:
+                                return True
+                        return False
+
+                    # Rebuild page lines from upright, non-table words only.
+                    # Masking tables prevents table cell values (e.g. "DKE", "DUK")
+                    # from being mistaken for section headings.
+                    _all_words = [
+                        w for w in (page.extract_words(use_text_flow=True) or [])
+                        if w.get("upright", True) and not _in_any_table(w)
+                    ]
+                    _lines_by_y: dict[int, list] = {}
+                    for w in _all_words:
+                        key = round(w.get("top", 0) / 3) * 3
+                        _lines_by_y.setdefault(key, []).append(w)
+                    page_lines = [
+                        " ".join(w["text"] for w in sorted(ws, key=lambda x: x.get("x0", 0)))
+                        for _, ws in sorted(_lines_by_y.items())
+                    ]
 
                     # tables — labelled with text spatially just above each table
-                    page_words = page.extract_words()
-                    for table_obj in (page.find_tables() or []):
+                    # Filter non-upright words (rotated sidebars) to avoid leaking
+                    # sidebar characters into captions and section headings.
+                    page_words = [w for w in (page.extract_words() or []) if w.get("upright", True)]
+                    for table_obj in _tables:
                         table_counter += 1
                         table_data = table_obj.extract()
                         rendered = _render_table(table_data)
@@ -521,10 +620,12 @@ def extract_paper_no_llm(path: Path) -> dict:
                                 key=lambda w: w.get("x0", 0),
                             )
                             caption_text = " ".join(w["text"] for w in line_words).strip()
-                            # Reject page-number-only or copyright footers
+                            # Reject footers, page numbers, and table header rows
                             if (caption_text
                                     and re.search(r"[A-Za-z]{3}", caption_text)
                                     and "rights reserved" not in caption_text.lower()
+                                    and "|" not in caption_text
+                                    and not _NOT_HEADING_RE.search(caption_text)
                                     and len(caption_text) <= 120):
                                 caption = caption_text
                             else:
@@ -554,11 +655,13 @@ def extract_paper_no_llm(path: Path) -> dict:
                     # section headings
                     for line in page_lines:
                         if _is_section_heading(line):
-                            sid = f"{doc_id}_sec_{re.sub(r'[^a-z0-9]+', '_', line.strip().lower()).strip('_')[:60]}"
+                            # Strip trailing revision/version single-char marks (e.g. "r", "v")
+                            clean_line = re.sub(r"\s+[a-z]$", "", line.strip())
+                            sid = f"{doc_id}_sec_{re.sub(r'[^a-z0-9]+', '_', clean_line.lower()).strip('_')[:60]}"
                             if sid not in nodes:
                                 nodes[sid] = {
                                     "id": sid,
-                                    "label": line.strip(),
+                                    "label": clean_line,
                                     "file_type": "paper",
                                     "source_file": rel,
                                     "source_location": f"L{page_num}",
