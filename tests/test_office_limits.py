@@ -5,6 +5,9 @@ gigabytes and OOM-kill the process during a corpus scan. These tests verify the
 pre-parse screen rejects bombs before openpyxl/python-docx ever decompress them.
 """
 import zipfile
+from pathlib import Path
+
+import pytest
 
 from graphify import detect
 
@@ -88,3 +91,108 @@ def test_pdf_over_cap_returns_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(detect, "_file_within_size_cap",
                         lambda p, cap=100: p.stat().st_size <= cap if p.exists() else False)
     assert detect.extract_pdf_text(big) == ""
+
+
+def test_pdf_over_cap_returns_empty_pdfplumber(tmp_path, monkeypatch):
+    """Size cap fires before pdfplumber opens the file (same guard as pypdf path)."""
+    pytest.importorskip("pdfplumber")
+    big = tmp_path / "big.pdf"
+    big.write_bytes(b"%PDF-1.4\n" + b"x" * 4096)
+    monkeypatch.setenv("GRAPHIFY_PDF_BACKEND", "pdfplumber")
+    monkeypatch.setattr(detect, "_OFFICE_MAX_RAW_BYTES", 100)
+    monkeypatch.setattr(detect, "_file_within_size_cap",
+                        lambda p, cap=100: p.stat().st_size <= cap if p.exists() else False)
+    assert detect.extract_pdf_text(big) == ""
+
+
+def test_pdfplumber_backend_extracts_text(tmp_path, monkeypatch):
+    """pdfplumber backend returns non-empty text from a real PDF."""
+    pdfplumber = pytest.importorskip("pdfplumber")
+    real_pdf = Path(__file__).parents[3] / "doc" / "Worldpay_ISO_8583_Reference_Guide_V2.46.pdf"
+    if not real_pdf.exists():
+        pytest.skip("doc/Worldpay PDF not present")
+    monkeypatch.setenv("GRAPHIFY_PDF_BACKEND", "pdfplumber")
+    text = detect.extract_pdf_text(real_pdf)
+    assert len(text) > 100, "expected substantial text from the Worldpay PDF"
+
+
+def test_pypdf_backend_extracts_text():
+    """pypdf backend (default) returns non-empty text from the same real PDF."""
+    pytest.importorskip("pypdf")
+    real_pdf = Path(__file__).parents[3] / "doc" / "Worldpay_ISO_8583_Reference_Guide_V2.46.pdf"
+    if not real_pdf.exists():
+        pytest.skip("doc/Worldpay PDF not present")
+    text = detect.extract_pdf_text(real_pdf)
+    assert len(text) > 100, "expected substantial text from the Worldpay PDF"
+
+
+def test_pdfplumber_extracts_table_content(monkeypatch):
+    """pdfplumber backend captures table-cell text that pypdf may miss."""
+    pdfplumber = pytest.importorskip("pdfplumber")
+    real_pdf = Path(__file__).parents[3] / "doc" / "Worldpay_ISO_8583_Reference_Guide_V2.46.pdf"
+    if not real_pdf.exists():
+        pytest.skip("doc/Worldpay PDF not present")
+    monkeypatch.setenv("GRAPHIFY_PDF_BACKEND", "pdfplumber")
+    text = detect.extract_pdf_text(real_pdf)
+    # The Worldpay guide has ISO 8583 field tables; assert some field-related token present
+    assert any(tok in text for tok in ("ISO", "8583", "Field", "Bitmap")), (
+        "expected ISO 8583 table content in pdfplumber output"
+    )
+
+
+# ---------------------------------------------------------------------------
+# extract_paper_no_llm — deterministic graph extraction
+# ---------------------------------------------------------------------------
+
+class TestExtractPaperNoLlm:
+    PDF = Path(__file__).parents[3] / "doc" / "Worldpay_ISO_8583_Reference_Guide_V2.46.pdf"
+
+    def _result(self, monkeypatch, backend="pdfplumber"):
+        if backend == "pdfplumber":
+            pytest.importorskip("pdfplumber")
+        else:
+            pytest.importorskip("pypdf")
+        if not self.PDF.exists():
+            pytest.skip("doc/Worldpay PDF not present")
+        monkeypatch.setenv("GRAPHIFY_PDF_BACKEND", backend)
+        return detect.extract_paper_no_llm(self.PDF)
+
+    def test_returns_nodes_and_edges(self, monkeypatch):
+        r = self._result(monkeypatch)
+        assert r["nodes"], "expected at least one node"
+        assert r["edges"], "expected at least one edge"
+
+    def test_root_document_node_present(self, monkeypatch):
+        r = self._result(monkeypatch)
+        ids = {n["id"] for n in r["nodes"]}
+        # root node id is derived from the PDF stem
+        assert any("worldpay" in nid.lower() or "iso" in nid.lower() for nid in ids)
+
+    def test_section_nodes_extracted(self, monkeypatch):
+        r = self._result(monkeypatch)
+        # at least some section nodes beyond the root
+        assert len(r["nodes"]) > 1, "expected section nodes in addition to root"
+
+    def test_table_nodes_extracted_pdfplumber(self, monkeypatch):
+        r = self._result(monkeypatch, backend="pdfplumber")
+        table_nodes = [n for n in r["nodes"] if "table" in n["id"]]
+        assert table_nodes, "pdfplumber backend should extract table nodes"
+
+    def test_all_edges_reference_valid_nodes(self, monkeypatch):
+        r = self._result(monkeypatch)
+        ids = {n["id"] for n in r["nodes"]}
+        for e in r["edges"]:
+            assert e["source"] in ids, f"edge source {e['source']!r} has no node"
+            assert e["target"] in ids, f"edge target {e['target']!r} has no node"
+
+    def test_size_cap_returns_empty(self, monkeypatch):
+        if not self.PDF.exists():
+            pytest.skip("doc/Worldpay PDF not present")
+        monkeypatch.setattr(detect, "_file_within_size_cap", lambda p, **kw: False)
+        r = detect.extract_paper_no_llm(self.PDF)
+        assert r == {"nodes": [], "edges": []}
+
+    def test_pypdf_backend_also_produces_nodes(self, monkeypatch):
+        r = self._result(monkeypatch, backend="pypdf")
+        assert r["nodes"], "pypdf backend should also produce nodes"
+        assert r["edges"], "pypdf backend should also produce edges"

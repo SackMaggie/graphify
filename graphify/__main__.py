@@ -3707,6 +3707,7 @@ def main() -> None:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
+                "[--no-llm] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S]",
                 file=sys.stderr,
@@ -3723,6 +3724,7 @@ def main() -> None:
         extract_mode: str | None = None
         out_dir: Path | None = None
         no_cluster = False
+        no_llm = False
         dedup_llm = False
         google_workspace = False
         global_merge = False
@@ -3781,6 +3783,8 @@ def main() -> None:
                 out_dir = Path(a.split("=", 1)[1]); i += 1
             elif a == "--no-cluster":
                 no_cluster = True; i += 1
+            elif a == "--no-llm":
+                no_llm = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
             elif a == "--google-workspace":
@@ -3909,7 +3913,7 @@ def main() -> None:
             _format_backend_env_keys,
             _get_backend_api_key,
         )
-        needs_llm = bool(semantic_files) or dedup_llm
+        needs_llm = (bool(semantic_files) and not no_llm) or dedup_llm
         if backend is None and needs_llm:
             backend = _detect_backend()
         if backend is not None and backend not in _BACKENDS:
@@ -3999,6 +4003,23 @@ def main() -> None:
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+
+        # Deterministic (no-LLM) extraction for paper files when --no-llm is set.
+        # Produces section and table nodes directly from PDF text without any API call.
+        if no_llm and paper_files:
+            from graphify.detect import extract_paper_no_llm as _extract_paper_no_llm
+            print(f"[graphify extract] --no-llm: deterministic extraction on {len(paper_files)} paper(s)...")
+            no_llm_nodes: list = []
+            no_llm_edges: list = []
+            for pf in paper_files:
+                result = _extract_paper_no_llm(pf)
+                no_llm_nodes.extend(result.get("nodes", []))
+                no_llm_edges.extend(result.get("edges", []))
+                print(f"  {pf.name}: {len(result.get('nodes', []))} nodes, {len(result.get('edges', []))} edges")
+            ast_result["nodes"].extend(no_llm_nodes)
+            ast_result["edges"].extend(no_llm_edges)
+            # Skip LLM semantic pass entirely — treat semantic_files as empty.
+            semantic_files = []
 
         # Semantic extraction on docs/papers/images. Check cache first.
         from graphify.cache import (

@@ -372,20 +372,238 @@ def classify_file(path: Path) -> FileType | None:
 
 
 def extract_pdf_text(path: Path) -> str:
-    """Extract plain text from a PDF file using pypdf."""
+    """Extract plain text from a PDF file.
+
+    Backend is selected via the GRAPHIFY_PDF_BACKEND environment variable:
+      - "pdfplumber" (requires pip install graphifyy[pdfplumber]) — better
+        layout fidelity and table extraction; preferred for research papers.
+      - "pypdf" (default, requires pip install graphifyy[pdf]) — lightweight.
+    """
     if not _file_within_size_cap(path):
         return ""
+    backend = os.environ.get("GRAPHIFY_PDF_BACKEND", "pypdf").lower()
     try:
-        from pypdf import PdfReader
-        reader = PdfReader(str(path))
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages.append(text)
-        return "\n".join(pages)
+        if backend == "pdfplumber":
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                pages = []
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        pages.append(text)
+                return "\n".join(pages)
+        else:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+            return "\n".join(pages)
     except Exception:
         return ""
+
+
+def _render_table(table: list) -> str:
+    """Render a pdfplumber table list-of-rows into a pipe-delimited text block."""
+    if not table:
+        return ""
+    col_widths: list[int] = []
+    for col_idx in range(len(table[0])):
+        col_widths.append(max(len(str(row[col_idx] or "")) for row in table if col_idx < len(row)))
+    lines = []
+    for row in table:
+        cells = []
+        for col_idx, cell in enumerate(row):
+            val = str(cell or "").replace("\n", " ")
+            width = col_widths[col_idx] if col_idx < len(col_widths) else 10
+            cells.append(val.ljust(width))
+        lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+# Numbered section heading: "1.", "1.2", "1.2.3" followed by title words.
+# e.g. "1. Introduction", "2.3 Field Definitions"
+_NUMBERED_HEADING_RE = re.compile(
+    r"^\d+(?:\.\d+)*\.?\s+[A-Za-z][A-Za-z0-9 /&:\-]{2,}$",
+    re.ASCII,
+)
+
+# ALL-CAPS heading that starts with a letter (not a digit/code row).
+# Requires 2+ consecutive letters so hex strings are rejected.
+_ALLCAPS_HEADING_RE = re.compile(
+    r"^[A-Z][A-Z ]{2,}$",
+    re.ASCII,
+)
+
+
+def extract_paper_no_llm(path: Path) -> dict:
+    """Deterministic (no-LLM) extraction of a PDF into a graphify nodes+edges dict.
+
+    Produces:
+    - One root document node per PDF.
+    - Section nodes for numbered headings ("2.3 Field Definitions") and short
+      ALL-CAPS title lines (letters only, max 5 words — not data rows).
+    - Table nodes labelled with the nearest preceding text line as a caption,
+      falling back to the table's first header row (pdfplumber backend).
+    - Structural edges: document/section → table/section (contains).
+
+    Backend follows GRAPHIFY_PDF_BACKEND (pdfplumber preferred for captions).
+    """
+    if not _file_within_size_cap(path):
+        return {"nodes": [], "edges": []}
+
+    def _is_section_heading(line: str) -> bool:
+        line = line.strip()
+        if not line:
+            return False
+        if _NUMBERED_HEADING_RE.match(line) and len(line) <= 100:
+            return True
+        if _ALLCAPS_HEADING_RE.match(line):
+            words = line.split()
+            if 1 <= len(words) <= 5 and all(re.fullmatch(r"[A-Z]+", w) for w in words):
+                return True
+        return False
+
+    def _caption_from_lines(page_lines: list[str], table_data: list) -> str:
+        """Best-effort label for a table from preceding page text or its header row."""
+        for line in reversed(page_lines):
+            line = line.strip()
+            if line and not line.startswith("---") and re.search(r"[A-Za-z]{3}", line):
+                return line[:100]
+        if table_data and table_data[0]:
+            header = " | ".join(str(c or "").strip() for c in table_data[0] if (c or "").strip())
+            if header:
+                return header[:100]
+        return ""
+
+    rel = path.name
+    doc_id = re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_")
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    nodes[doc_id] = {
+        "id": doc_id,
+        "label": path.stem,
+        "file_type": "paper",
+        "source_file": rel,
+        "source_location": "L1",
+    }
+
+    backend = os.environ.get("GRAPHIFY_PDF_BACKEND", "pypdf").lower()
+
+    try:
+        if backend == "pdfplumber":
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                section_id: str | None = None
+                table_counter = 0
+                for page_num, page in enumerate(pdf.pages, start=1):
+                    page_text = page.extract_text(layout=False) or ""
+                    page_lines = page_text.splitlines()
+
+                    # tables — labelled with text spatially just above each table
+                    page_words = page.extract_words()
+                    for table_obj in (page.find_tables() or []):
+                        table_counter += 1
+                        table_data = table_obj.extract()
+                        rendered = _render_table(table_data)
+                        # Use words whose bottom edge is above the table's top edge
+                        # (pdfplumber y-axis: 0 = page top, increases downward)
+                        table_top = table_obj.bbox[1]
+                        words_above = [w for w in page_words if w.get("bottom", 0) <= table_top]
+                        if words_above:
+                            # Group into lines by y-coord, take the nearest line above
+                            last_y = max(w.get("bottom", 0) for w in words_above)
+                            line_words = sorted(
+                                [w for w in words_above if abs(w.get("bottom", 0) - last_y) < 3],
+                                key=lambda w: w.get("x0", 0),
+                            )
+                            caption_text = " ".join(w["text"] for w in line_words).strip()
+                            # Reject page-number-only or copyright footers
+                            if (caption_text
+                                    and re.search(r"[A-Za-z]{3}", caption_text)
+                                    and "rights reserved" not in caption_text.lower()
+                                    and len(caption_text) <= 120):
+                                caption = caption_text
+                            else:
+                                caption = _caption_from_lines([], table_data)
+                        else:
+                            caption = _caption_from_lines([], table_data)
+                        label = f"{caption} (p{page_num})" if caption else f"Table {table_counter} (p{page_num})"
+                        tid = f"{doc_id}_table_{table_counter}"
+                        nodes[tid] = {
+                            "id": tid,
+                            "label": label,
+                            "file_type": "paper",
+                            "source_file": rel,
+                            "source_location": f"L{page_num}",
+                            "body": rendered,
+                        }
+                        edges.append({
+                            "source": section_id or doc_id,
+                            "target": tid,
+                            "relation": "contains",
+                            "confidence": "EXTRACTED",
+                            "confidence_score": 1.0,
+                            "source_file": rel,
+                            "weight": 1.0,
+                        })
+
+                    # section headings
+                    for line in page_lines:
+                        if _is_section_heading(line):
+                            sid = f"{doc_id}_sec_{re.sub(r'[^a-z0-9]+', '_', line.strip().lower()).strip('_')[:60]}"
+                            if sid not in nodes:
+                                nodes[sid] = {
+                                    "id": sid,
+                                    "label": line.strip(),
+                                    "file_type": "paper",
+                                    "source_file": rel,
+                                    "source_location": f"L{page_num}",
+                                }
+                                edges.append({
+                                    "source": doc_id,
+                                    "target": sid,
+                                    "relation": "contains",
+                                    "confidence": "EXTRACTED",
+                                    "confidence_score": 1.0,
+                                    "source_file": rel,
+                                    "weight": 1.0,
+                                })
+                            section_id = sid
+        else:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            section_id = None
+            for page_num, page in enumerate(reader.pages, start=1):
+                text = page.extract_text() or ""
+                for line in text.splitlines():
+                    if _is_section_heading(line):
+                        sid = f"{doc_id}_sec_{re.sub(r'[^a-z0-9]+', '_', line.strip().lower()).strip('_')[:60]}"
+                        if sid not in nodes:
+                            nodes[sid] = {
+                                "id": sid,
+                                "label": line.strip(),
+                                "file_type": "paper",
+                                "source_file": rel,
+                                "source_location": f"L{page_num}",
+                            }
+                            edges.append({
+                                "source": doc_id,
+                                "target": sid,
+                                "relation": "contains",
+                                "confidence": "EXTRACTED",
+                                "confidence_score": 1.0,
+                                "source_file": rel,
+                                "weight": 1.0,
+                            })
+                        section_id = sid
+    except Exception:
+        pass
+
+    return {"nodes": list(nodes.values()), "edges": edges}
 
 
 def docx_to_markdown(path: Path) -> str:
