@@ -172,6 +172,36 @@ def test_extract_codeonly_succeeds_without_api_key(monkeypatch, tmp_path):
     assert len(json.loads(graph.read_text()).get("nodes", [])) > 0
 
 
+def test_extract_no_llm_ingests_docs_without_key(monkeypatch, tmp_path):
+    """--no-llm runs a deterministic markdown baseline for documents, so a
+    doc-bearing corpus produces a graph with NO API key instead of aborting.
+
+    Without --no-llm the same corpus must still error (asserted separately) —
+    this flag is purely additive."""
+    corpus = _make_corpus(tmp_path)  # code + a Markdown doc
+    out_dir = tmp_path / "out"
+    _clear_backend_keys(monkeypatch)
+    monkeypatch.setattr("graphify.llm.detect_backend", lambda: None)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys, "argv",
+        ["graphify", "extract", str(corpus), "--no-llm", "--out", str(out_dir)],
+    )
+
+    try:
+        mainmod.main()
+    except SystemExit as exc:
+        assert exc.code in (None, 0), f"unexpected exit code {exc.code}"
+
+    graph = out_dir / "graphify-out" / "graph.json"
+    assert graph.exists(), "--no-llm must write graph.json without a key"
+    import json
+    data = json.loads(graph.read_text())
+    labels = " ".join(n.get("label", "") for n in data.get("nodes", []))
+    assert data.get("nodes"), "--no-llm doc baseline produced no nodes"
+    assert "README" in labels or "Notes" in labels
+
+
 def test_extract_out_keeps_project_root_clean(monkeypatch, tmp_path):
     """`extract --out DIR` routes every artifact to DIR/graphify-out/ and the
     scanned project must not grow a graphify-out/ (or anything else) beside

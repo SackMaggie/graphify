@@ -3937,7 +3937,7 @@ def main() -> None:
         if len(sys.argv) < 3:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
-                "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
+                "[--model M] [--mode deep] [--no-llm] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo]",
                 file=sys.stderr,
@@ -3962,6 +3962,7 @@ def main() -> None:
         cli_cargo: bool = False
         no_cluster = False
         dedup_llm = False
+        no_llm = False
         google_workspace = False
         global_merge = False
         global_repo_tag: str | None = None
@@ -4021,6 +4022,11 @@ def main() -> None:
                 no_cluster = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
+            elif a == "--no-llm":
+                # Deterministic-only: code AST + extract_markdown baseline on docs,
+                # skip the semantic LLM pass, never require an API key. Additive —
+                # without this flag the original (LLM, may-abort) path is unchanged.
+                no_llm = True; i += 1
             elif a == "--google-workspace":
                 google_workspace = True; i += 1
             elif a == "--global":
@@ -4164,7 +4170,15 @@ def main() -> None:
             _format_backend_env_keys,
             _get_backend_api_key,
         )
-        needs_llm = bool(semantic_files) or dedup_llm
+        # --no-llm: deterministic-only. Documents get an extract_markdown baseline
+        # (below) instead of the semantic LLM pass, and no API key is required.
+        if no_llm and (semantic_files or dedup_llm):
+            print(
+                f"[graphify extract] --no-llm: skipping semantic pass for "
+                f"{len(semantic_files)} doc/paper/image file(s); deterministic only.",
+                file=sys.stderr,
+            )
+        needs_llm = (bool(semantic_files) or dedup_llm) and not no_llm
         if backend is None and needs_llm:
             backend = _detect_backend()
         if backend is not None and backend not in _BACKENDS:
@@ -4258,6 +4272,23 @@ def main() -> None:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
 
+        # --no-llm deterministic doc baseline: run the structural extractors
+        # (extract_markdown etc.) on markdown documents so docs yield nodes with
+        # no API key. Applied to ALL markdown regardless of paper/doc heuristic.
+        doc_baseline: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+        if no_llm:
+            from graphify.extract import _get_extractor as _ext_for
+            md_docs = [Path(p) for p in (doc_files + paper_files)
+                       if _ext_for(Path(p)) is not None]
+            if md_docs:
+                from graphify.extract import extract as _ast_extract
+                print(f"[graphify extract] --no-llm doc baseline on {len(md_docs)} markdown file(s)...")
+                try:
+                    doc_baseline = _ast_extract(md_docs, cache_root=out_root)
+                except Exception as exc:
+                    print(f"[graphify extract] doc baseline failed: {exc}", file=sys.stderr)
+                    doc_baseline = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+
         # Semantic extraction on docs/papers/images. Check cache first.
         from graphify.cache import (
             check_semantic_cache as _check_semantic_cache,
@@ -4269,7 +4300,7 @@ def main() -> None:
         }
         sem_cache_hits = 0
         sem_cache_misses = 0
-        if semantic_files:
+        if semantic_files and not no_llm:
             sem_paths_str = [str(p) for p in semantic_files]
             cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
                 _check_semantic_cache(sem_paths_str, root=out_root)
@@ -4381,8 +4412,8 @@ def main() -> None:
         # for symbols also referenced in docs). Hyperedges only come from the
         # semantic side.
         merged: dict = {
-            "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])) + list(cargo_result.get("nodes", [])),
-            "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])) + list(cargo_result.get("edges", [])),
+            "nodes": list(ast_result.get("nodes", [])) + list(doc_baseline.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])) + list(cargo_result.get("nodes", [])),
+            "edges": list(ast_result.get("edges", [])) + list(doc_baseline.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])) + list(cargo_result.get("edges", [])),
             "hyperedges": list(sem_result.get("hyperedges", [])),
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
